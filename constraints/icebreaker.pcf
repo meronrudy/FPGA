@@ -1,0 +1,18 @@
+# iCEBreaker v1.0 PCF constraints
+# Device: iCE40UP5K-SG48
+# Clock: 12 MHz XO -> pin 35
+# LED: D1 -> pin 39
+# No external reset in Phase 1 (internal synchronous POR in top)
+
+# Clock input
+set_io clk 35
+
+# LED output
+set_io led 39
+
+# Reserved mappings for Phase 1.5 (UART or streaming I/O) - commented for now
+# set_io uart_tx <pin>
+# set_io uart_rx <pin>
+# set_io sample_in[0]  <pin>
+# set_io sample_in[1]  <pin>
+# ...

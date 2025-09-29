@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py38"
+line-length = 100
+extend-exclude = [
+  "build",
+  "artifacts",
+  "**/__pycache__",
+]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",  # pycodestyle/pyflakes
+  "I",            # isort
+  "UP",           # pyupgrade
+  "N",            # pep8-naming
+  "B",            # bugbear
+  "A",            # flake8-builtins
+  "C4",           # flake8-comprehensions
+  "SIM",          # flake8-simplify
+  "T20",          # flake8-print (we want to avoid prints)
+]
+ignore = [
+  # Keep initially light; can be tightened later as code evolves
+]
+
+[tool.mypy]
+python_version = "3.8"
+ignore_missing_imports = true
+strict_optional = true
+warn_return_any = true
+warn_unused_ignores = true
+exclude = "(^build/|^artifacts/|^sim/cocotb/)"

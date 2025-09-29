@@ -1,0 +1,27 @@
+# Yosys synthesis script for iCEBreaker (iCE40UP5K-SG48)
+# Top: fir8_top
+# Inputs:
+#   - src/rtl/fir8_top.v
+#   - src/rtl/fir8.v
+# Outputs (ensure 'build' dir exists before running):
+#   - build/fir8_top.json      (netlist for nextpnr)
+#   - build/fir8_top_netlist.v (tech-mapped verilog, optional)
+#   - build/yosys_stat.json    (utilization summary)
+
+# Read RTL
+read_verilog -sv src/rtl/fir8.v
+read_verilog -sv src/rtl/fir8_top.v
+
+# Hierarchy and sanity
+hierarchy -check -top fir8_top
+check
+
+# Synthesize for iCE40
+# -abc9 for improved mapping
+synth_ice40 -top fir8_top -json build/fir8_top.json -abc9 -relut
+
+# Optional: write a mapped verilog for inspection
+write_verilog -noexpr -attr2comment build/fir8_top_netlist.v
+
+# Stats in machine-readable form
+stat -json build/yosys_stat.json

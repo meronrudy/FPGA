@@ -1,0 +1,32 @@
+# Variants grid for Phase 1 CI, simulation, and synthesis
+# Allowed parameters:
+# - TAPS: 4, 8, 16, 32
+# - PIPELINE: 0, 1
+# - ROUND: 0, 1
+# - SAT: 0, 1
+#
+# Optional per-variant strategy hooks:
+# - yosys_opts: extra switches appended to synth_ice40
+# - nextpnr_opts: extra switches appended to nextpnr-ice40
+# - seed: integer seed passed to nextpnr-ice40
+#
+# The agents/synth.py aggregates timing/utilization into artifacts/variants_summary.csv
+
+variants:
+  - name: baseline8
+    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 8 }
+
+  - name: pipelined8
+    params: { ROUND: 1, SAT: 1, PIPELINE: 1, TAPS: 8 }
+
+  - name: baseline16
+    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 16 }
+
+  - name: baseline32
+    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 32 }
+
+  - name: resource4
+    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 4 }
+    yosys_opts: "-abc9 -relut"
+    nextpnr_opts: "--placer heap --router router2"
+    seed: 1

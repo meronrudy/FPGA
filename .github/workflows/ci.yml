@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  sim:
+    name: Sim (cocotb) - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: baseline8,  taps: 8,  pipeline: 0, round: 1, sat: 1 }
+          - { name: pipelined8, taps: 8,  pipeline: 1, round: 1, sat: 1 }
+          - { name: baseline16, taps: 16, pipeline: 0, round: 1, sat: 1 }
+          - { name: baseline32, taps: 32, pipeline: 0, round: 1, sat: 1 }
+          - { name: resource4,  taps: 4,  pipeline: 0, round: 1, sat: 1 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install system deps (sim)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator iverilog make
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run cocotb (verilator)
+        env:
+          ROUND: ${{ matrix.round }}
+          SAT: ${{ matrix.sat }}
+          PIPELINE: ${{ matrix.pipeline }}
+          TAPS: ${{ matrix.taps }}
+          SIM: verilator
+          COCOTB_RESULTS_FILE: build/cocotb_results_${{ matrix.name }}.xml
+        run: |
+          make -C sim/cocotb SIM=verilator
+
+      - name: Upload sim artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-${{ matrix.name }}
+          path: |
+            build/coverage_${{ matrix.taps }}_${{ matrix.pipeline }}_${{ matrix.round }}_${{ matrix.sat }}.yml
+            build/cocotb_results_${{ matrix.name }}.xml
+          if-no-files-found: warn
+
+  formal:
+    name: Formal (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install formal tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y yosys symbiyosys boolector
+      - name: Run SBY
+        run: |
+          make formal
+
+  synth:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    name: Synthesis/PnR - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: baseline8 }
+          - { name: pipelined8 }
+          - { name: baseline16 }
+          - { name: baseline32 }
+          - { name: resource4 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install system deps (synth)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y yosys nextpnr-ice40 icestorm icetime make
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build single variant
+        run: |
+          python3 agents/synth.py --only ${{ matrix.name }}
+
+      - name: Upload synth artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: synth-${{ matrix.name }}
+          path: |
+            build/${{ matrix.name }}/**
+          if-no-files-found: warn
+
+  aggregate:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    name: Aggregate reports
+    needs: [synth]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Download all synth artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: synth-*
+          merge-multiple: true
+          path: .
+
+      - name: Aggregate variant summaries
+        run: |
+          mkdir -p artifacts
+          OUT=artifacts/variants_summary.csv
+          echo "variant,TAPS,PIPELINE,ROUND,SAT,FMAX_nextpnr_MHz,FMAX_icetime_MHz,Slack_ns_12MHz,Meets_12MHz,LUT4,LUT4_pct,DFF,DFF_pct,BRAM_4K,BRAM_pct,DSP_MAC16,DSP_pct" > "${OUT}"
+          shopt -s nullglob
+          for s in build/*/summary.csv; do
+            # append without header
+            tail -n +2 "$s" >> "${OUT}"
+          done
+          echo "[aggregate] Wrote ${OUT}"
+          test -s "${OUT}"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate Phase 1 report
+        run: |
+          python3 scripts/mk_phase1_report.py
+
+      - name: Upload Phase 1 report
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-report
+          path: |
+            artifacts/**
+          if-no-files-found: error

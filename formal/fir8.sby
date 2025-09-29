@@ -1,0 +1,19 @@
+[options]
+mode bmc
+depth 20
+expect pass
+
+# Non-blocking in CI (configured in workflow), but here we aim for Boolector
+# Engines definition
+[engines]
+smtbmc boolector
+
+[script]
+# Read parameterized RTL and formal wrapper (SystemVerilog)
+read -sv src/rtl/fir8.v
+read -sv formal/fir8_formal.v
+prep -top fir8_formal
+
+[files]
+src/rtl/fir8.v
+formal/fir8_formal.v

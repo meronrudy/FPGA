@@ -1,21 +1,27 @@
-# Parameterized Q1.15 Moving‑Average FIR on iCE40UP5K
 
-[CI badge — replace with your repository URL](.github/workflows/ci.yml)
+## CrewAI orchestrator and safety gates
 
-This project implements a parameterized moving‑average FIR filter in fixed‑point Q1.15 for the Lattice iCE40UP5K (iCEBreaker). It includes RTL, cocotb simulation, synthesis/PnR (Yosys/nextpnr-ice40/Icestorm), optional formal checks, and scripts to aggregate timing/utilization reports.
+This repo includes an orchestration layer compatible with CrewAI that coordinates the agents and enforces safety gates:
+- Orchestrator (CrewAI‑compatible, local fallback): [orchestrator/crew.py](orchestrator/crew.py)
+- Agents:
+  - Designer (config validation/normalization): [agents/designer.py](agents/designer.py)
+  - Simulation (cocotb): [agents/sim.py](agents/sim.py)
+  - Synthesis/PnR (Yosys → nextpnr → icepack): [agents/synth.py](agents/synth.py)
+  - Analysis (report generation): [agents/analysis.py](agents/analysis.py)
+  - Board (optional hardware flash/smoke with locking): [agents/board.py](agents/board.py)
 
-Design parameters:
-- TAPS: 4, 8, 16, 32 (power‑of‑two)
-- PIPELINE: 0 or 1 (adds +1 output register when 1)
-- ROUND: 0 or 1 (truncate vs symmetric round‑to‑nearest)
-- SAT: 0 or 1 (wrap vs saturate to Q1.15)
+Promotion policy (“promote late”):
+- A variant must pass simulation before synthesis runs.
+- Hardware is never touched unless both simulation and synthesis succeed.
+- The board agent uses a file‑based lock to ensure a single iCEBreaker is programmed at a time and enforces cooldown between flashes. Hardware CI is manual‑approval gated.
 
-Core RTL and top:
-- Core: [src/rtl/fir8.v](src/rtl/fir8.v)
-- iCEBreaker top: [src/rtl/fir8_top.v](src/rtl/fir8_top.v)
-- Constraints: [constraints/icebreaker.pcf](constraints/icebreaker.pcf)
+CrewAI usage:
+- If the `crewai` library is installed (see [requirements.txt](requirements.txt)), the orchestrator initializes Crew/Agents; execution still uses robust subprocess boundaries.
+- If `crewai` is not installed, the orchestrator runs in local mode automatically.
+- Details and runbook: [docs/crewai.md](docs/crewai.md)
 
-See fixed‑point background in [docs/fixed_point.md](docs/fixed_point.md).
+Virtual wind tunnel sketchpad:
+- Blueprint for a tiered, parallel software gauntlet (lint/smoke, randomized sim, formal micro‑checks, and synth dry‑run) to prune designs before hardware. See [docs/windtunnel.md](docs/windtunnel.md).
 
 ## High‑level architecture
 
@@ -46,13 +52,13 @@ Tooling details: [scripts/check_imports.py](scripts/check_imports.py)
 
 Use the agent to launch the cocotb Makefile‑driven testbench:
 ```bash
-python agents/sim.py --help
+python -m agents.sim --help
 ```
 
 Example (Verilator) with safe defaults that match the repository Makefile:
 ```bash
 # The cocotb Makefile defaults TOPLEVEL=fir8; pass matching --top to be explicit.
-python agents/sim.py --sim verilator --top fir8 --taps 8 --pipeline 0
+python -m agents.sim --sim verilator --top fir8 --taps 8 --pipeline 0
 ```
 
 Notes:
@@ -73,17 +79,17 @@ The synthesis agent drives yosys → nextpnr‑ice40 → icepack, one build dire
 
 Help:
 ```bash
-python agents/synth.py --help
+python -m agents.synth --help
 ```
 
 Build all configured variants:
 ```bash
-python agents/synth.py
+python -m agents.synth
 ```
 
 Build a subset:
 ```bash
-python agents/synth.py --only baseline8,pipelined8
+python -m agents.synth --only baseline8,pipelined8
 ```
 
 Artifacts per variant (under `build/<variant>/`):
@@ -108,22 +114,73 @@ Outputs:
 - `artifacts/report_phase1.md`
 - `artifacts/variants_summary.csv`
 
-Report generator: [scripts/mk_phase1_report.py](scripts/mk_phase1_report.py)
+The report includes a “Hardware smoke results” section when smoke artifacts exist (produced by the board agent). Report generator: [scripts/mk_phase1_report.py](scripts/mk_phase1_report.py)
 
-## Configuration management
+### Orchestrated end‑to‑end runs (software‑only)
 
-Design variants and flow options are defined in [configs/variants.yaml](configs/variants.yaml). The synthesis agent expects entries with uppercase `params` (ROUND/SAT/PIPELINE/TAPS) and optional flow hooks. A separate configuration loader supports a minimal schema for designer tooling.
+Run orchestrated pipeline locally without hardware:
+```bash
+python -m orchestrator.crew --variants baseline8
+```
 
-- Variants: [configs/variants.yaml](configs/variants.yaml)
+Local dry run convenience wrapper:
+```bash
+bash scripts/local_dry_run.sh baseline8
+# Optional acceptance checks & Slack ping:
+ACCEPTANCE=1 SLACK_WEBHOOK_URL=https://hooks.slack... bash scripts/local_dry_run.sh baseline8
+```
+
+Acceptance tests for gating logic:
+```bash
+pytest tests/acceptance/test_gates.py -q
+```
+
+## Configuration management (flat schema)
+
+Design variants and flow options are defined in [configs/variants.yaml](configs/variants.yaml). The repository uses a flat schema compatible with [common/config.py](common/config.py):
+- Required per variant:
+  - name (str), taps (int), pipeline (int|bool), round (“round”|“truncate”), sat (“saturate”|“wrap”)
+- Optional:
+  - seed (int), yosys_opts (str), nextpnr_opts (str), freq (int MHz; defaults to 12)
+
+Helpers:
 - Designer agent (YAML → normalized JSON): [agents/designer.py](agents/designer.py)
 - Config loader/validation: [common/config.py](common/config.py)
+- Legacy nested→flat converter: [scripts/convert_variants_schema.py](scripts/convert_variants_schema.py)
 
 How to author and validate configs: [docs/configuration.md](docs/configuration.md)
+
+## Hardware lane (board agent)
+
+The board agent performs an SRAM flash and basic smoke test, with safety features:
+- Exclusive resource lock: [common/resources.py](common/resources.py)
+- Cooldown between flashes
+- Smoke record under `artifacts/hw/<variant>/<timestamp>/smoke.json`
+
+Run directly:
+```bash
+python -m agents.board --variant baseline8 --cooldown 5
+```
+
+Or run orchestrator with hardware (requires iCEBreaker attached and `iceprog`):
+```bash
+python -m orchestrator.crew --variants baseline8 --with-hardware
+```
+
+In CI, hardware runs are gated with manual approval and Slack notifications. See [\.github/workflows/ci.yml](.github/workflows/ci.yml).
+
+## Slack notifications
+
+A minimal notifier is included; if `SLACK_WEBHOOK_URL` is not set, notifications are skipped (non‑fatal):
+- Notifier: [common/notify.py](common/notify.py)
+- Example:
+```bash
+python -m common.notify --status success --variant baseline8 --message "Hardware smoke passed"
+```
 
 ## Logging
 
 Centralized logging is initialized by agents and scripts. Control verbosity via the `LOG_LEVEL` environment variable or CLI verbosity flags where available.
-
 - Logging utilities: [common/logging.py](common/logging.py)
 - Details and policies: [docs/logging_config.md](docs/logging_config.md)
 
@@ -159,12 +216,29 @@ Style, typing, docstrings, PR checks, and pre‑PR smoke steps are described in 
 
 ## Additional references
 
+- CrewAI plan and runbook: [docs/crewai.md](docs/crewai.md)
+- Virtual wind tunnel sketchpad: [docs/windtunnel.md](docs/windtunnel.md)
 - Hardware architecture and ports: [docs/architecture.md](docs/architecture.md)
 - Hardware specification: [docs/hw_spec.md](docs/hw_spec.md)
 - Fixed‑point background: [docs/fixed_point.md](docs/fixed_point.md)
 - FIR reference guide (Q1.15, rounding, saturation): [docs/reference_fir.md](docs/reference_fir.md)
 - CLI reference for all agents and scripts: [docs/cli_reference.md](docs/cli_reference.md)
 
-## License
+# Parameterized Q1.15 Moving‑Average FIR on iCE40UP5K
 
-MIT — see [LICENSE](LICENSE).
+[CI badge — replace with your repository URL](.github/workflows/ci.yml)
+
+This project implements a parameterized moving‑average FIR filter in fixed‑point Q1.15 for the Lattice iCE40UP5K (iCEBreaker). It includes RTL, cocotb simulation, synthesis/PnR (Yosys/nextpnr-ice40/Icestorm), optional formal checks, and scripts to aggregate timing/utilization reports.
+
+Design parameters:
+- TAPS: 4, 8, 16, 32 (power‑of‑two)
+- PIPELINE: 0 or 1 (adds +1 output register when 1)
+- ROUND: 0 or 1 (truncate vs symmetric round‑to‑nearest)
+- SAT: 0 or 1 (wrap vs saturate to Q1.15)
+
+Core RTL and top:
+- Core: [src/rtl/fir8.v](src/rtl/fir8.v)
+- iCEBreaker top: [src/rtl/fir8_top.v](src/rtl/fir8_top.v)
+- Constraints: [constraints/icebreaker.pcf](constraints/icebreaker.pcf)
+
+See fixed‑point background in [docs/fixed_point.md](docs/fixed_point.md).

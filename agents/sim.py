@@ -1,18 +1,39 @@
 #!/usr/bin/env python3
 """
-Simulation agent: drive the cocotb testbench via Make with configurable parameters.
+Simulation agent — cocotb driver with parameter resolution and environment bridging.
 
-This tool launches the cocotb test in [sim/cocotb/Makefile](sim/cocotb/Makefile), passing the
-test module (MODULE), HDL top (TOPLEVEL), and optional design parameters (TAPS, PIPELINE, ROUND, SAT)
-via environment variables. Parameters can be sourced from a named variant in
-[configs/variants.yaml](configs/variants.yaml) and overridden explicitly via CLI flags.
+Purpose
+- Launch the cocotb Makefile for the configured TOPLEVEL and test MODULE, mapping variant parameters
+  into environment variables expected by the Make-based flow.
 
-Exit codes:
-    0  success
-    2  file not found (Makefile) or YAML parse error
-    3  validation/config error (e.g., missing variant, bad types)
-    4  subprocess failure (Make returned non-zero)
-    1  unexpected error
+Data flow
+- Inputs:
+  - Variant name (--variant) resolved from configs/variants.yaml (flat schema)
+  - Optional explicit overrides (--taps, --pipeline, --round, --sat)
+  - Simulator selection (--sim), TOPLEVEL (--top), test MODULE (--module)
+- Parameter resolution:
+  - Merge: {variant params} ← {CLI overrides}
+  - Validate types and ranges (taps>0, pipeline∈{0,1}, round∈{round,truncate}, sat∈{saturate,wrap})
+- Environment mapping to the Makefile:
+  - MODULE  → test module name (e.g., test_fir8)
+  - TOPLEVEL → DUT top module (e.g., fir8_top or fir8)
+  - SIM     → verilator | icarus (optional)
+  - TAPS, PIPELINE, ROUND, SAT (strings) exported only when present
+
+Outputs and artifacts
+- Real-time logs via stdout/stderr from 'make -f sim/cocotb/Makefile'
+- Cocotb result XML / coverage (if configured by the Makefile) in build/
+
+Exit codes
+  0 success
+  2 Makefile missing or YAML parse error
+  3 configuration/validation error (e.g., bad override types, unknown variant)
+  4 subprocess failure (non-zero Make return code)
+  1 unexpected error
+
+Error handling and logging
+- Clear logging of resolved env (MODULE, TOPLEVEL, SIM, TAPS/PIPELINE/ROUND/SAT if set).
+- Input validation errors are raised as ConfigError → exit 3.
 """
 
 from __future__ import annotations

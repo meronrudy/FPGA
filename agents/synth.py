@@ -1,34 +1,51 @@
 #!/usr/bin/env python3
 """
-Parameterized per-variant synthesis/PnR driver for iCE40 (iCEBreaker UP5K).
+Synthesis/PnR agent — per-variant build, metrics extraction, and CSV aggregation (iCE40 UP5K).
 
-Features:
-- Loads configs/variants.yaml and filters via --only variant1,variant2
-- Validates parameter ranges (TAPS in {4,8,16,32}; ROUND/SAT/PIPELINE in {0,1})
-- Generates a per-variant Yosys script and runs:
-    read_verilog -sv src/rtl/fir8.v src/rtl/fir8_top.v
-    chparam -set ROUND ... -set SAT ... fir8
-    chparam -set TAPS  ... -set PIPELINE ... fir8_top
-    hierarchy -check -top fir8_top
-    synth_ice40 -top fir8_top -json build/<variant>/fir8_top.json -abc9 -relut [plus variant.yosys_opts if present]
-    write_verilog -noexpr -attr2comment build/<variant>/fir8_top_netlist.v
-    stat -json build/<variant>/yosys_stat.json
-- Runs nextpnr_ice40.sh with env for JSON/ASC/PCF/TOP/FREQ and optional NEXTPNR_OPTS/SEED
-- Packs with icestorm_pack.sh to BIN
-- Parses timing/resources with scripts/parse_nextpnr_report.py producing build/<variant>/summary.csv
-- Aggregates all summaries into artifacts/variants_summary.csv
+Purpose
+- Given a validated, flat-schema variants file, build each selected variant through:
+  Yosys → nextpnr-ice40 → icestorm pack, then parse timing/resource reports and aggregate results.
 
-Exit behavior:
-- On any failing subprocess, logs the variant name and exits non-zero.
-- Performs basic YAML schema checks and parameter validation with clear errors.
+Data flow
+- Inputs:
+  - configs/variants.yaml (flat), validated via common.config.load_config
+  - Optional per-variant strategy knobs: yosys_opts, nextpnr_opts, seed, freq (MHz)
+- Parameter mapping:
+  - round: "round"→1, "truncate"→0  (applies to core fir8)
+  - sat:   "saturate"→1, "wrap"→0    (applies to core fir8)
+  - pipeline: bool|{0,1}→{0,1}       (applies to top fir8_top)
+  - taps: one of {4,8,16,32}         (applies to top fir8_top)
+- Outputs:
+  - build/<variant>/: fir8_top.json, fir8_top.asc, fir8_top.bin, fir8_top_netlist.v, yosys_stat.json, summary.csv
+  - artifacts/variants_summary.csv aggregated across built variants
 
-Usage:
-  python3 agents/synth.py               # build all variants
-  python3 agents/synth.py --only baseline8,pipelined8
+Nominal flow (per variant)
+  1) Yosys:
+     read_verilog -sv src/rtl/fir8.v src/rtl/fir8_top.v
+     chparam -set ROUND .. -set SAT .. fir8                 # core behavior
+     chparam -set TAPS .. -set PIPELINE .. fir8_top         # wrapper/latency
+     hierarchy -check -top fir8_top
+     synth_ice40 -top fir8_top -json build/<v>/fir8_top.json -abc9 -relut [<yosys_opts>]
+     write_verilog -noexpr -attr2comment build/<v>/fir8_top_netlist.v
+     stat -json build/<v>/yosys_stat.json
+  2) Place/Route:
+     bash synth/ice40/nextpnr_ice40.sh (env JSON/ASC/PCF/TOP/FREQ and optional NEXTPNR_OPTS/SEED)
+  3) Pack:
+     bash synth/ice40/icestorm_pack.sh → BIN
+  4) Parse timing/resources:
+     python3 scripts/parse_nextpnr_report.py build/<variant>
 
-Logging:
-- Centralized logging via common.logging; LOG_LEVEL env controls verbosity (default INFO).
+Error handling
+- Validation errors (schema/values) → log error and exit(1) at CLI entry.
+- Subprocess failures are surfaced with clear variant context; the first failure causes exit(1).
+- Missing summary.csv files for a variant are skipped during aggregation with a warning.
+
+Exit codes
+- 0 on success (all selected variants built and aggregation written)
+- 1 if any selected variant build fails
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
@@ -37,11 +54,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-
-import yaml
+from typing import Any, Dict, List, Optional
 
 from common.logging import setup_logging, get_logger
+from common.config import load_config, ConfigError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "configs" / "variants.yaml"
@@ -58,62 +74,126 @@ ALLOWED_TAPS = {4, 8, 16, 32}
 log = get_logger(__name__)
 
 
-def load_variants(path: Path) -> List[Dict[str, Any]]:
+def _coerce_pipeline(val: Any) -> int:
     """
-    Load and validate the variants configuration from a YAML file.
+    Normalize pipeline flag to 0/1.
 
-    The file is expected to be a mapping with a 'variants' list, where each element
-    has keys: 'name' and 'params' containing ROUND, SAT, PIPELINE, TAPS, with valid ranges.
+    Accepted:
+      - bool → 1/0
+      - int in {0,1}
 
-    Parameters:
-        path: Path to configs/variants.yaml.
-
-    Returns:
-        A list of validated variant dictionaries.
-
-    Exit Codes:
-        Exits with code 2 on schema errors, missing file, or invalid parameter values.
+    Raises:
+      ValueError for other values.
     """
-    if not path.exists():
-        log.error(f"[error] Variants file not found: {path}")
-        sys.exit(2)
-    with path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    if not isinstance(data, dict) or "variants" not in data or not isinstance(data["variants"], list):
-        log.error("[error] variants.yaml schema invalid: expected {'variants': [ ... ]}")
-        sys.exit(2)
-    variants = data["variants"]
-    for idx, v in enumerate(variants):
-        if "name" not in v or "params" not in v:
-            log.error(f"[error] variants[{idx}] missing 'name' or 'params'")
-            sys.exit(2)
-        p = v["params"]
-        for key in ("ROUND", "SAT", "PIPELINE", "TAPS"):
-            if key not in p:
-                log.error(f"[error] variants[{idx}] '{v['name']}' missing param '{key}'")
-                sys.exit(2)
-        # Type normalization
-        try:
-            p["ROUND"] = int(p["ROUND"])
-            p["SAT"] = int(p["SAT"])
-            p["PIPELINE"] = int(p["PIPELINE"])
-            p["TAPS"] = int(p["TAPS"])
-        except Exception as ex:
-            log.error(f"[error] variants[{idx}] '{v['name']}' param type error: {ex}")
-            sys.exit(2)
-        # Validate ranges
-        if p["TAPS"] not in ALLOWED_TAPS:
-            log.error(f"[error] variants[{idx}] '{v['name']}': TAPS must be one of {sorted(ALLOWED_TAPS)} (got {p['TAPS']})")
-            sys.exit(2)
-        for bkey in ("ROUND", "SAT", "PIPELINE"):
-            if p[bkey] not in (0, 1):
-                log.error(f"[error] variants[{idx}] '{v['name']}': {bkey} must be 0 or 1 (got {p[bkey]})")
-                sys.exit(2)
+    if isinstance(val, bool):
+        return 1 if val else 0
+    if isinstance(val, int):
+        if val in (0, 1):
+            return val
+    raise ValueError(f"PIPELINE must be 0 or 1 (or bool), got {val!r}")
+
+
+def _coerce_round(val: Optional[str]) -> int:
+    """
+    Map textual rounding mode to toolchain flag.
+
+    Mapping:
+      "round" → 1
+      "truncate" → 0
+      None → default 1 (round)
+
+    Raises:
+      ValueError if not in {"round","truncate"}.
+    """
+    if val is None:
+        # Default to "round" if unspecified
+        return 1
+    if val not in ("round", "truncate"):
+        raise ValueError("round must be 'round' or 'truncate'")
+    return 1 if val == "round" else 0
+
+
+def _coerce_sat(val: Optional[str]) -> int:
+    """
+    Map textual saturation mode to toolchain flag.
+
+    Mapping:
+      "saturate" → 1
+      "wrap"     → 0
+      None → default 1 (saturate)
+
+    Raises:
+      ValueError if not in {"saturate","wrap"}.
+    """
+    if val is None:
+        # Default to "saturate" if unspecified
+        return 1
+    if val not in ("saturate", "wrap"):
+        raise ValueError("sat must be 'saturate' or 'wrap'")
+    return 1 if val == "saturate" else 0
+
+
+def load_flat_variants(path: Path) -> List[Dict[str, Any]]:
+    """
+    Load and validate flat-schema variants via common.config.load_config.
+
+    Returns a list of normalized variant dicts:
+      {
+        'name': str,
+        'params': {'TAPS': int, 'PIPELINE': 0|1, 'ROUND': 0|1, 'SAT': 0|1},
+        'yosys_opts': str (optional),
+        'nextpnr_opts': str (optional),
+        'seed': int (optional),
+        'freq': int (optional, default 12)
+      }
+    """
+    cfg = load_config(path)
+    norm: List[Dict[str, Any]] = []
+    for idx, v in enumerate(cfg.variants):
+        if not isinstance(v, dict):
+            raise ConfigError(f"variants[{idx}] must be a mapping")
+        if "name" not in v or not isinstance(v["name"], str) or not v["name"].strip():
+            raise ConfigError(f"variants[{idx}].name must be a non-empty string")
+        name = v["name"].strip()
+
+        if "taps" not in v or not isinstance(v["taps"], int):
+            raise ConfigError(f"variants[{idx}].taps must be an integer")
+        taps = int(v["taps"])
+        if taps not in ALLOWED_TAPS:
+            raise ConfigError(f"variants[{idx}] '{name}': taps must be one of {sorted(ALLOWED_TAPS)} (got {taps})")
+
+        pipeline = _coerce_pipeline(v.get("pipeline", 0))
+        rnd = _coerce_round(v.get("round"))
+        sat = _coerce_sat(v.get("sat"))
+        freq = v.get("freq", 12)
+        if not isinstance(freq, int) or freq <= 0:
+            raise ConfigError(f"variants[{idx}] '{name}': freq must be a positive integer MHz when present")
+
         # Optional strategy hooks
-        for opt in ("yosys_opts", "nextpnr_opts", "seed"):
-            if opt in v and v[opt] is None:
-                del v[opt]
-    return variants
+        out: Dict[str, Any] = {
+            "name": name,
+            "params": {
+                "TAPS": taps,
+                "PIPELINE": pipeline,
+                "ROUND": rnd,
+                "SAT": sat,
+            },
+            "freq": freq,
+        }
+        if "yosys_opts" in v and v["yosys_opts"]:
+            if not isinstance(v["yosys_opts"], str):
+                raise ConfigError(f"variants[{idx}] '{name}': yosys_opts must be string when present")
+            out["yosys_opts"] = v["yosys_opts"]
+        if "nextpnr_opts" in v and v["nextpnr_opts"]:
+            if not isinstance(v["nextpnr_opts"], str):
+                raise ConfigError(f"variants[{idx}] '{name}': nextpnr_opts must be string when present")
+            out["nextpnr_opts"] = v["nextpnr_opts"]
+        if "seed" in v and v["seed"] is not None:
+            if not isinstance(v["seed"], int):
+                raise ConfigError(f"variants[{idx}] '{name}': seed must be integer when present")
+            out["seed"] = int(v["seed"])
+        norm.append(out)
+    return norm
 
 
 def filter_variants(variants: List[Dict[str, Any]], only: Optional[str]) -> List[Dict[str, Any]]:
@@ -127,8 +207,8 @@ def filter_variants(variants: List[Dict[str, Any]], only: Optional[str]) -> List
     Returns:
         A filtered list of variant dicts.
 
-    Exit Codes:
-        Exits with code 2 if any requested variant name is unknown.
+    Raises:
+        ConfigError if any requested variant name is unknown.
     """
     if not only:
         return variants
@@ -136,8 +216,7 @@ def filter_variants(variants: List[Dict[str, Any]], only: Optional[str]) -> List
     sel = [v for v in variants if v["name"] in names]
     missing = [n for n in names if n not in {v["name"] for v in variants}]
     if missing:
-        log.error(f"[error] --only contained unknown variants: {', '.join(missing)}")
-        sys.exit(2)
+        raise ConfigError(f"--only contained unknown variants: {', '.join(missing)}")
     return sel
 
 
@@ -147,7 +226,7 @@ def write_yosys_script(build_dir: Path, variant: Dict[str, Any]) -> Path:
 
     Parameters:
         build_dir: The variant's build directory.
-        variant: The variant dictionary containing 'name', 'params', and optional 'yosys_opts'.
+        variant: Normalized variant dict including 'name', 'params', and optional 'yosys_opts'.
 
     Returns:
         Path to the generated run.ys script.
@@ -159,13 +238,10 @@ def write_yosys_script(build_dir: Path, variant: Dict[str, Any]) -> Path:
     stat_out = build_dir / "yosys_stat.json"
 
     yosys_opts = variant.get("yosys_opts", "")
-    # Compose synth_ice40 line with defaults and optional extras
     synth_line = f"synth_ice40 -top fir8_top -json {json_out} -abc9 -relut"
     if yosys_opts:
         synth_line += f" {yosys_opts}"
 
-    # IMPORTANT: chparam both the core (ROUND/SAT) and the top-level (TAPS/PIPELINE)
-    # because fir8_top forwards TAPS/PIPELINE as instance overrides.
     ys = f"""# Auto-generated Yosys script for variant {name}
 read_verilog -sv {SRC_RTL[0]} {SRC_RTL[1]}
 chparam -set ROUND {params['ROUND']} -set SAT {params['SAT']} fir8
@@ -181,17 +257,7 @@ stat -json {stat_out}
 
 
 def run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> None:
-    """
-    Run a subprocess command with optional working directory and environment.
-
-    Parameters:
-        cmd: The command and arguments to execute.
-        cwd: Optional working directory.
-        env: Optional environment variables to pass to the subprocess.
-
-    Raises:
-        RuntimeError: If the subprocess exits with a non-zero status.
-    """
+    """Run a subprocess command with optional working directory and environment."""
     log.info(f"[run] {' '.join(cmd)}")
     try:
         subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=True)
@@ -202,9 +268,6 @@ def run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]
 def build_variant(variant: Dict[str, Any]) -> Path:
     """
     Build the specified variant through Yosys, nextpnr, and icestorm pack; then parse results.
-
-    Parameters:
-        variant: The variant dictionary with 'name', 'params', and optional flow options.
 
     Returns:
         The Path to the variant's build directory.
@@ -241,7 +304,7 @@ def build_variant(variant: Dict[str, Any]) -> Path:
         "JSON": str(build_dir / "fir8_top.json"),
         "ASC": str(build_dir / "fir8_top.asc"),
         "PCF": str(PCF),
-        "FREQ": "12",
+        "FREQ": str(variant.get("freq", 12)),
         # Pass through optional options
         "NEXTPNR_OPTS": str(variant.get("nextpnr_opts", "")).strip(),
     })
@@ -279,17 +342,10 @@ def build_variant(variant: Dict[str, Any]) -> Path:
 def aggregate_summaries(variant_names: List[str]) -> Path:
     """
     Aggregate per-variant summary.csv files into artifacts/variants_summary.csv.
-
-    Parameters:
-        variant_names: Names of variants to include in the aggregation.
-
-    Returns:
-        Path to the aggregated CSV in artifacts/.
     """
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     out_csv = ARTIFACTS_DIR / "variants_summary.csv"
 
-    # Header as specified
     header = [
         "variant", "TAPS", "PIPELINE", "ROUND", "SAT",
         "FMAX_nextpnr_MHz", "FMAX_icetime_MHz", "Slack_ns_12MHz", "Meets_12MHz",
@@ -308,7 +364,6 @@ def aggregate_summaries(variant_names: List[str]) -> Path:
                 rows = list(csv.reader(fh_in))
                 if not rows:
                     continue
-                # Skip header of the per-variant summary (first row)
                 for row in rows[1:]:
                     writer.writerow(row)
 
@@ -329,12 +384,16 @@ def main() -> None:
     setup_logging()
     _ = get_logger(__name__)  # Ensures module logger is configured
 
-    parser = argparse.ArgumentParser(description="Parameterized per-variant synth/PnR for iCE40")
+    parser = argparse.ArgumentParser(description="Parameterized per-variant synth/PnR for iCE40 (flat-schema config)")
     parser.add_argument("--only", help="Comma-separated variant names to build", default=None)
     args = parser.parse_args()
 
-    variants = load_variants(CONFIG_PATH)
-    selected = filter_variants(variants, args.only)
+    try:
+        variants = load_flat_variants(CONFIG_PATH)
+        selected = filter_variants(variants, args.only)
+    except (ConfigError, ValueError) as e:
+        log.error(f"[error] Config validation: {e}")
+        sys.exit(1)
 
     built_names: List[str] = []
     for v in selected:

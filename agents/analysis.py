@@ -3,7 +3,9 @@
 Analysis agent to generate Phase 1 report artifacts.
 
 This module invokes scripts/mk_phase1_report.py from the repository root
-and emits a generated report at artifacts/report_phase1.md.
+and emits a generated report at artifacts/report_phase1.md. The report
+includes a Hardware smoke results section when artifacts exist under
+artifacts/hw.
 
 Logging is centralized via common.logging. LOG_LEVEL environment variable
 controls verbosity (default INFO). No work is executed at import time.

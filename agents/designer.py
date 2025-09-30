@@ -1,19 +1,42 @@
 """
-Designer agent: load design variants from YAML and emit a validated JSON form.
+Designer agent — normalize and validate design variants for downstream automation.
 
-This tool reads the project configuration from [configs/variants.yaml](configs/variants.yaml),
-validates its minimal schema using [common/config.py](common/config.py), and writes a normalized
-JSON file for downstream tools in artifacts.
+Purpose
+- Source of truth for variant definitions. Loads YAML, validates a flat schema, and emits a normalized JSON
+  artifact for reproducible downstream consumption (sim, synth, CI aggregation).
+- Keeps schema strict but forwards unknown keys to allow forward-compatibility.
 
-Example:
-    python -m agents.designer --input configs/variants.yaml --output artifacts/variants.json -v
+Data flow
+- Inputs:
+  - YAML config (default: configs/variants.yaml) containing 'variants' list with flat keys:
+    - name (str), taps (int), pipeline (int|bool), round ("round"|"truncate"), sat ("saturate"|"wrap")
+    - optional: seed (int), yosys_opts (str), nextpnr_opts (str), freq (int)
+- Processing:
+  - Validates shape and types via common.config.load_config; raises ConfigError on violations.
+  - No mutation of unknown keys (they are preserved).
+- Outputs:
+  - Normalized JSON at artifacts/variants.json (path configurable via --output) to support
+    debug audits, reproducibility, and later pipeline queries.
 
-Exit codes:
-    0  success
-    2  file not found or YAML parse error
-    3  schema validation error
-    4  output write/permission error
-    1  unexpected error
+Interaction in pipeline
+- Typically called by the orchestrator preflight to surface config errors early.
+- Not strictly required for sim/synth (they validate again), but recommended to centralize schema checks.
+
+CLI
+  python -m agents.designer --input configs/variants.yaml --output artifacts/variants.json -v
+
+Exit codes
+  0  success
+  2  file not found or YAML parse error
+  3  schema validation error
+  4  output write/permission error
+  1  unexpected error
+
+Error handling and logging
+- FileNotFoundError and yaml.YAMLError mapped to exit 2.
+- ConfigError mapped to exit 3.
+- PermissionError mapped to exit 4.
+- Any other exception returns 1 and logs a traceback for diagnostics.
 """
 
 from __future__ import annotations

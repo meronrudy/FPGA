@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import json
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -37,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ART_DIR = REPO_ROOT / "artifacts"
 SUMMARY_CSV = ART_DIR / "variants_summary.csv"
 REPORT_MD = ART_DIR / "report_phase1.md"
+HW_DIR = ART_DIR / "hw"
 
 # Device totals for sanity checks (iCE40UP5K estimates)
 LUT4_TOTAL = 5280
@@ -105,9 +107,33 @@ def sanity_check_resources(rows: List[Dict[str, str]]) -> None:
         sys.exit(3)
 
 
+def _find_latest_smoke_path(variant: str) -> Optional[Path]:
+    """Return the latest smoke.json path for a variant, if any."""
+    vdir = HW_DIR / variant
+    if not vdir.exists() or not vdir.is_dir():
+        return None
+    # Timestamps are lexicographically sortable (YYYYMMDD-HHMMSS)
+    subdirs = sorted([d for d in vdir.iterdir() if d.is_dir()])
+    if not subdirs:
+        return None
+    cand = subdirs[-1] / "smoke.json"
+    return cand if cand.exists() else None
+
+
+def _load_smoke_record(p: Path) -> Optional[Dict[str, str]]:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _bitstream_for_variant(variant: str) -> Path:
+    return REPO_ROOT / "build" / variant / "fir8_top.bin"
+
+
 def render_report(rows: List[Dict[str, str]]) -> str:
     """
-    Render the Markdown report content. Does not modify files.
+    Render the Markdown report content, including hardware smoke results when available.
     """
     # Sort rows by variant name for stable output
     rows = sorted(rows, key=lambda r: r.get("variant", ""))
@@ -139,10 +165,50 @@ def render_report(rows: List[Dict[str, str]]) -> str:
                 dsp=r.get("DSP_MAC16", ""),
             )
         )
+
+    # Hardware smoke results section (if any)
     md.append("")
-    md.append("Artifacts:")
+    md.append("## Hardware smoke results")
+    any_hw = False
+    md.append("| Variant | Status | Message | Smoke record | Bitstream |")
+    md.append("|---|:---:|---|---|---|")
+    for r in rows:
+        variant = r.get("variant", "")
+        if not variant:
+            continue
+        sp = _find_latest_smoke_path(variant)
+        if not sp:
+            continue
+        rec = _load_smoke_record(sp) or {}
+        status = str(rec.get("status", "unknown")).lower()
+        emoji = "✅" if status == "ok" else ("❌" if status == "fail" else "ℹ️")
+        message = str(rec.get("message", ""))
+        bs = rec.get("bitstream") or str(_bitstream_for_variant(variant))
+        bs_exists = Path(bs).exists()
+        smoke_link = f"[smoke.json]({sp})"
+        bs_link = f"[bin]({bs})" if bs_exists else bs
+        md.append(f"| {variant} | {emoji} | {message} | {smoke_link} | {bs_link} |")
+        any_hw = True
+    if not any_hw:
+        md.append("_No hardware smoke records found (artifacts/hw/)._")
+
+    # Artifact links
+    md.append("")
+    md.append("## Artifacts")
     md.append("- artifacts/variants_summary.csv")
     md.append("- artifacts/report_phase1.md (this file)")
+    # Bitstreams (if present)
+    have_any_bin = False
+    for r in rows:
+        variant = r.get("variant", "")
+        if not variant:
+            continue
+        bp = _bitstream_for_variant(variant)
+        if bp.exists():
+            if not have_any_bin:
+                md.append("- Bitstreams:")
+                have_any_bin = True
+            md.append(f"  - {variant}: [{bp}]({bp})")
     md.append("")
     return "\n".join(md)
 

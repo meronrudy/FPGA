@@ -1,32 +1,53 @@
-# Variants grid for Phase 1 CI, simulation, and synthesis
-# Allowed parameters:
-# - TAPS: 4, 8, 16, 32
-# - PIPELINE: 0, 1
-# - ROUND: 0, 1
-# - SAT: 0, 1
+# Variants grid (flat schema) for Phase 1 CI, simulation, and synthesis
+# Flat keys validated by common.config.Config:
+# - name: string (required)
+# - taps: int (required; allowed: 4, 8, 16, 32)
+# - pipeline: int|bool (optional; 0 or 1)
+# - round: "round"|"truncate" (optional)
+# - sat: "saturate"|"wrap" (optional)
+# - seed: int (optional)
+# - yosys_opts: string (optional; extra switches appended to synth_ice40)
+# - nextpnr_opts: string (optional; extra switches appended to nextpnr-ice40)
+# - freq: int MHz (optional; default 12 for iCEBreaker)
 #
-# Optional per-variant strategy hooks:
-# - yosys_opts: extra switches appended to synth_ice40
-# - nextpnr_opts: extra switches appended to nextpnr-ice40
-# - seed: integer seed passed to nextpnr-ice40
-#
-# The agents/synth.py aggregates timing/utilization into artifacts/variants_summary.csv
+# Notes:
+# - agents/sim.py loads this flat schema directly
+# - agents/synth.py maps:
+#     round: "round" => ROUND=1, "truncate" => ROUND=0
+#     sat:   "saturate" => SAT=1, "wrap" => SAT=0
+#     pipeline: coerced to 0/1
+# - artifacts aggregated into artifacts/variants_summary.csv
 
 variants:
   - name: baseline8
-    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 8 }
+    taps: 8
+    pipeline: 0
+    round: "round"
+    sat: "saturate"
 
   - name: pipelined8
-    params: { ROUND: 1, SAT: 1, PIPELINE: 1, TAPS: 8 }
+    taps: 8
+    pipeline: 1
+    round: "round"
+    sat: "saturate"
 
   - name: baseline16
-    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 16 }
+    taps: 16
+    pipeline: 0
+    round: "round"
+    sat: "saturate"
 
   - name: baseline32
-    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 32 }
+    taps: 32
+    pipeline: 0
+    round: "round"
+    sat: "saturate"
 
   - name: resource4
-    params: { ROUND: 1, SAT: 1, PIPELINE: 0, TAPS: 4 }
+    taps: 4
+    pipeline: 0
+    round: "round"
+    sat: "saturate"
     yosys_opts: "-abc9 -relut"
     nextpnr_opts: "--placer heap --router router2"
     seed: 1

@@ -2,3 +2,4 @@
 cocotb==1.8.2
 cocotb-coverage==1.2.0
 PyYAML==6.0.1
+crewai

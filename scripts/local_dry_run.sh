@@ -1,106 +1,105 @@
 #!/usr/bin/env bash
-# Local Phase 1 dry-run:
-#  1) Run three cocotb variants locally:
-#     - baseline8     (TAPS=8,  PIPELINE=0, ROUND=1, SAT=1)
-#     - round_no_sat  (TAPS=8,  PIPELINE=0, ROUND=1, SAT=0)
-#     - pipelined8    (TAPS=8,  PIPELINE=1, ROUND=1, SAT=1)
-#  2) Build all configured variants via agents/synth.py
-#  3) Print artifact locations and slack summary table
-#
-# Requirements:
-#  - Verilator or Icarus, Yosys, nextpnr-ice40, icestorm, icetime
-#  - Python deps from requirements.txt
-#
+# Minimal local end-to-end dry run (software-only) with optional acceptance checks.
 # Usage:
-#  ./scripts/local_dry_run.sh
+#   scripts/local_dry_run.sh [variant]
+# Env:
+#   SIM=verilator|icarus (default: verilator)
+#   ACCEPTANCE=1 to run acceptance checks (Slack ping, artifact asserts)
+#   SLACK_WEBHOOK_URL for Slack check (optional)
+
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SIM_DIR="${ROOT_DIR}/sim/cocotb"
-BUILD_DIR="${ROOT_DIR}/build"
-ART_DIR="${ROOT_DIR}/artifacts"
+usage() {
+  cat <<'EOF'
+local_dry_run.sh - run software-only pipeline locally
 
-# Colors
-RED="$(printf '\033[31m')"
-GRN="$(printf '\033[32m')"
-YEL="$(printf '\033[33m')"
-BLU="$(printf '\033[34m')"
-RST="$(printf '\033[0m')"
+Usage:
+  scripts/local_dry_run.sh [variant]
 
-log() { echo -e "${BLU}[*]${RST} $*"; }
-ok()  { echo -e "${GRN}[OK]${RST} $*"; }
-err() { echo -e "${RED}[ERR]${RST} $*"; }
+Environment:
+  SIM                Cocotb simulator (default: verilator)
+  ACCEPTANCE=1       Enable acceptance checks (Slack ping, artifact asserts)
+  SLACK_WEBHOOK_URL  Webhook for Slack acceptance ping (optional)
 
-check_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 2; }
+Steps:
+  1) Designer validate config
+  2) Simulation via cocotb (Make)
+  3) Synthesis/PnR (bitstream + summary)
+  4) Report generation (includes hardware section if artifacts exist)
+
+Examples:
+  scripts/local_dry_run.sh baseline8
+  SIM=icarus scripts/local_dry_run.sh baseline16
+  ACCEPTANCE=1 scripts/local_dry_run.sh baseline8
+EOF
 }
 
-run_cocotb() {
-  local name="$1" taps="$2" pipeline="$3" round="$4" sat="$5"
-  log "Cocotb: ${name} (TAPS=${taps} PIPELINE=${pipeline} ROUND=${round} SAT=${sat})"
-  ( ROUND="${round}" SAT="${sat}" PIPELINE="${pipeline}" TAPS="${taps}" SIM=verilator \
-    make -C "${SIM_DIR}" SIM=verilator )
-  local cov="${BUILD_DIR}/coverage_${taps}_${pipeline}_${round}_${sat}.yml"
-  if [[ -f "${cov}" ]]; then
-    ok "Coverage written: ${cov}"
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "$REPO_DIR"
+
+VARIANT="${1:-baseline8}"
+SIM="${SIM:-verilator}"
+
+echo "[dry-run] Repo: ${REPO_DIR}"
+echo "[dry-run] Variant: ${VARIANT}"
+echo "[dry-run] Simulator: ${SIM}"
+
+# 1) Designer (non-fatal if skipped downstream)
+echo "[dry-run] Designer validation"
+python -m agents.designer || true
+
+# 2) Simulation
+echo "[dry-run] Simulation (cocotb)"
+python -m agents.sim --variant "${VARIANT}" --sim "${SIM}"
+
+# 3) Synthesis/PnR
+echo "[dry-run] Synthesis/PnR"
+python agents/synth.py --only "${VARIANT}"
+
+# 4) Report
+echo "[dry-run] Analysis/report"
+python -m agents.analysis
+
+echo "[dry-run] Completed software-only flow for variant '${VARIANT}'"
+
+# Optional acceptance checks
+if [[ "${ACCEPTANCE:-0}" == "1" ]]; then
+  echo "[acceptance] Running acceptance checks"
+
+  # Check key artifacts exist
+  BIN="build/${VARIANT}/fir8_top.bin"
+  REPORT="artifacts/report_phase1.md"
+  SUMMARY="artifacts/variants_summary.csv"
+
+  if [[ ! -f "${BIN}" ]]; then
+    echo "[acceptance][FAIL] Missing bitstream: ${BIN}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SUMMARY}" ]]; then
+    echo "[acceptance][FAIL] Missing summary CSV: ${SUMMARY}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${REPORT}" ]]; then
+    echo "[acceptance][FAIL] Missing report: ${REPORT}" >&2
+    exit 1
+  fi
+
+  echo "[acceptance] Artifacts present ✅"
+
+  # Slack ping (non-fatal if not configured)
+  if [[ -n "${SLACK_WEBHOOK_URL:-}" ]]; then
+    echo "[acceptance] Slack notification ping"
+    python -m common.notify --status info --variant "${VARIANT}" --message "Acceptance ping from local_dry_run.sh"
   else
-    err "Coverage YAML not found: ${cov}"
-  fi
-}
-
-slack_summary() {
-  local csv="${ART_DIR}/variants_summary.csv"
-  if [[ ! -f "${csv}" ]]; then
-    err "Summary CSV not found: ${csv}"
-    return 1
-  fi
-  echo
-  echo "Slack summary @12 MHz (ns):"
-  echo "variant, Slack_ns_12MHz, Meets_12MHz"
-  # Fields (1-based):
-  # 1=variant, 8=Slack_ns_12MHz, 9=Meets_12MHz
-  tail -n +2 "${csv}" | cut -d, -f1,8,9
-}
-
-main() {
-  log "Repo root: ${ROOT_DIR}"
-
-  # Tool checks
-  check_cmd python3
-  check_cmd make
-
-  # Optional: prefer Verilator; fall back to Icarus if verilator missing
-  if ! command -v verilator >/dev/null 2>&1; then
-    log "Verilator not found; attempting Icarus for sim"
-    export SIM=icarus
+    echo "[acceptance] SLACK_WEBHOOK_URL not set; skipping Slack ping"
   fi
 
-  # 1) Cocotb runs
-  run_cocotb "baseline8"    8 0 1 1
-  run_cocotb "round_no_sat" 8 0 1 0
-  run_cocotb "pipelined8"   8 1 1 1
+  echo "[acceptance] Completed ✅"
+fi
 
-  # 2) Synthesis/PnR (all configured variants)
-  log "Running agents/synth.py for all variants..."
-  python3 "${ROOT_DIR}/agents/synth.py"
-
-  # 3) Aggregate report (ensure we have summaries and markdown)
-  log "Generating Phase 1 report..."
-  python3 "${ROOT_DIR}/scripts/mk_phase1_report.py"
-
-  echo
-  ok "Artifacts directory: ${ART_DIR}"
-  if [[ -f "${ART_DIR}/variants_summary.csv" ]]; then
-    ok "Summary CSV: ${ART_DIR}/variants_summary.csv"
-  fi
-  if [[ -f "${ART_DIR}/report_phase1.md" ]]; then
-    ok "Markdown report: ${ART_DIR}/report_phase1.md"
-  fi
-
-  # Print slack summary
-  slack_summary || true
-  echo
-  ok "Local dry-run completed."
-}
-
-main "$@"
+echo "[dry-run] Done."
